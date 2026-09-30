@@ -1,0 +1,20 @@
+{
+	"name": "pi-cyber-compact-fallback",
+	"version": "0.1.0",
+	"description": "Retry pi session compaction with a configurable fallback model when the upstream rejects the summarization request with a content-policy error.",
+	"keywords": ["pi-package"],
+	"license": "MIT",
+	"type": "module",
+	"private": true,
+	"pi": {
+		"extensions": ["./extensions/index.ts"]
+	},
+	"files": ["extensions", "src", "README.md", "LICENSE"],
+	"scripts": {
+		"test": "node --test test/*.test.ts"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-ai": "*",
+		"@earendil-works/pi-coding-agent": "*"
+	}
+}
