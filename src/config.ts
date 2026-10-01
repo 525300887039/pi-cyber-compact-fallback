@@ -42,9 +42,24 @@ const KNOWN_KEYS = new Set<keyof FallbackConfig>([
 	"promptTemplate",
 ]);
 
+/**
+ * Node rewrites a `setTimeout` delay above this to 1 ms (with a `TimeoutOverflowWarning`), which
+ * would turn a long request deadline into an instant abort. `idleTimeoutMs` feeds a timer, so
+ * values above the largest representable delay are capped instead of accepted as-is.
+ */
+export const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
 export function resolveAgentDir(env: NodeJS.ProcessEnv = process.env): string {
 	const override = env.PI_CODING_AGENT_DIR;
-	return override && override.trim() !== "" ? override : join(homedir(), ".pi", "agent");
+	if (!override || override.trim() === "") return join(homedir(), ".pi", "agent");
+	// Same expansion pi's own `getAgentDir` performs (`~`, `~/…`, and `~\…` on Windows): an
+	// unexpanded `~/…` would otherwise be read as a path relative to the process cwd. Absolute
+	// and relative paths are passed through unchanged, exactly like the host does.
+	if (override === "~") return homedir();
+	if (override.startsWith("~/") || (process.platform === "win32" && override.startsWith("~\\"))) {
+		return join(homedir(), override.slice(2));
+	}
+	return override;
 }
 
 export function resolveConfigPaths(cwd: string, env: NodeJS.ProcessEnv = process.env): ConfigPaths {
@@ -135,18 +150,27 @@ function normalizeLayer(raw: Record<string, unknown>, path: string, warnings: st
 		}
 	}
 
-	const positiveNumber = (key: "maxSummaryTokens" | "maxConversationChars" | "idleTimeoutMs", min: number): void => {
+	const positiveNumber = (
+		key: "maxSummaryTokens" | "maxConversationChars" | "idleTimeoutMs",
+		min: number,
+		max?: number,
+	): void => {
 		const value = raw[key];
 		if (value === undefined) return;
 		if (typeof value === "number" && Number.isFinite(value) && value >= min) {
-			out[key] = value;
+			if (max !== undefined && value > max) {
+				warnings.push(`${path} 的 ${key} 超过 Node 计时器上限 ${max}ms，已按上限处理`);
+				out[key] = max;
+			} else {
+				out[key] = value;
+			}
 		} else {
 			warnings.push(`${path} 的 ${key} 必须是不小于 ${min} 的数字，已忽略`);
 		}
 	};
 	positiveNumber("maxSummaryTokens", 1);
 	positiveNumber("maxConversationChars", 1_000);
-	positiveNumber("idleTimeoutMs", 0);
+	positiveNumber("idleTimeoutMs", 0, MAX_TIMER_DELAY_MS);
 
 	if (raw.promptTemplate !== undefined) {
 		const value = raw.promptTemplate;

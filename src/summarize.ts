@@ -6,7 +6,7 @@
  * one-shot and would only pollute the prompt cache.
  */
 
-import { uuidv7 } from "@earendil-works/pi-ai";
+import { type StopReason, uuidv7 } from "@earendil-works/pi-ai";
 import { convertToLlm, serializeConversation } from "@earendil-works/pi-coding-agent";
 
 import type { FallbackConfig } from "./types.ts";
@@ -14,13 +14,21 @@ import type { FallbackConfig } from "./types.ts";
 /** Structural view of the pieces of `ModelRegistry` this module uses. */
 export interface ModelCaller {
 	find(provider: string, modelId: string): unknown;
-	complete(model: unknown, context: unknown, options?: unknown): Promise<SummaryResponse>;
+	/** Provider-neutral call: it routes virtual models, unlike the api-specific `complete`. */
 	streamSimple(model: unknown, context: unknown, options?: unknown): { result(): Promise<SummaryResponse> };
 }
 
 export interface SummaryResponse {
 	content: Array<{ type: string; text?: string }>;
 	usage?: unknown;
+	/**
+	 * pi-ai's completion contract. Only `"stop"` is a complete answer: `"length"` carries
+	 * partial text, `"error"`/`"aborted"`/`"pending"` are unfinished, `"toolUse"`/`"deferred"`
+	 * are not summaries. Anything else must never become a session checkpoint.
+	 */
+	stopReason: StopReason;
+	/** Provider error text, set when `stopReason` is `"error"`. */
+	errorMessage?: string;
 }
 
 export interface SummarizeDeps {
@@ -110,12 +118,17 @@ export function buildSummaryPrompt(input: {
 	const parts: string[] = [];
 
 	if (input.template) {
-		parts.push(
-			input.template
-				.replaceAll("{conversation}", input.conversationText)
-				.replaceAll("{previousSummary}", input.previousSummary ?? "")
-				.replaceAll("{customInstructions}", input.customInstructions ?? ""),
-		);
+		// One native pass with a callback, not chained `replaceAll`: the values are inserted
+		// verbatim (no `$&` / `$'` / `` $` `` / `$$` expansion) and are never rescanned, so a
+		// conversation that quotes `{previousSummary}` stays literal instead of pulling in the
+		// old summary. Missing values become empty strings; unknown placeholders stay as-is.
+		const placeholder = /\{(conversation|previousSummary|customInstructions)\}/g;
+		const values: Record<string, string> = {
+			conversation: input.conversationText,
+			previousSummary: input.previousSummary ?? "",
+			customInstructions: input.customInstructions ?? "",
+		};
+		parts.push(input.template.replace(placeholder, (match, name: string) => values[name] ?? match));
 		return parts.join("\n\n");
 	}
 
@@ -162,6 +175,36 @@ function extractText(response: SummaryResponse): string {
 		.trim();
 }
 
+/**
+ * Mirrors pi's own `getSummarizationFailure` (not exported), but stricter: only `"stop"`
+ * passes. A partial `"length"` answer is non-empty, so nothing may look at its text.
+ */
+function describeIncompleteResponse(response: SummaryResponse): { message: string; level: "warning" | "error" } | undefined {
+	switch (response.stopReason) {
+		case "stop":
+			break;
+		case "error":
+			return { message: `摘要失败：${response.errorMessage || "未知错误"}`, level: "error" };
+		case "length":
+			return { message: "摘要达到 token 上限而被截断，内容不完整", level: "warning" };
+		case "aborted":
+			return { message: "摘要请求已被中止（aborted）", level: "warning" };
+		case "pending":
+			return { message: "摘要请求尚未完成（pending）", level: "warning" };
+		case "toolUse":
+			return { message: "摘要响应尝试调用工具（toolUse）", level: "warning" };
+		default:
+			return { message: `摘要未正常结束（stopReason=${String(response.stopReason)}）`, level: "warning" };
+	}
+
+	// pi rejects tool calls in a summary; a `"stop"` response can still carry one.
+	if (response.content.some((part) => part.type === "toolCall")) {
+		return { message: "摘要响应包含工具调用（toolCall）", level: "warning" };
+	}
+
+	return undefined;
+}
+
 export async function summarize(input: SummarizeInput, config: FallbackConfig, deps: SummarizeDeps): Promise<SummarizeOutcome | undefined> {
 	const provider = config.fallbackProvider;
 	const modelId = config.fallbackModel;
@@ -187,6 +230,14 @@ export async function summarize(input: SummarizeInput, config: FallbackConfig, d
 	// Everything is inside the try: this function must never throw, because a throw from an
 	// event handler leaves pi with no result and the caller's state machine armed forever.
 	try {
+		// An already-aborted signal means the request must not be sent at all. The signal is
+		// checked again after the response, because a call that ignores cancellation (fake or
+		// real) must not be able to persist a summary the user already cancelled.
+		if (deps.signal?.aborted) {
+			deps.notify(`回退模型 ${provider}/${modelId} 摘要请求在发出前已被取消，已放弃回退压缩`, "warning");
+			return undefined;
+		}
+
 		const conversationText = serializeForSummary(input, config.maxConversationChars);
 		const prompt = buildSummaryPrompt({
 			conversationText,
@@ -206,11 +257,25 @@ export async function summarize(input: SummarizeInput, config: FallbackConfig, d
 			sessionId: uuidv7(),
 		};
 
-		const response = config.thinkingLevel
-			? await deps.modelRegistry
-					.streamSimple(model, messages, { ...baseOptions, reasoning: config.thinkingLevel })
-					.result()
-			: await deps.modelRegistry.complete(model, messages, baseOptions);
+		// Always the provider-neutral simple stream. `complete()` takes api-specific options and
+		// bypasses the virtual-model router, so a configured virtual model would fail there;
+		// `streamSimple` accepts the same options and the optional `reasoning` level.
+		const response = await deps.modelRegistry
+			.streamSimple(model, messages, config.thinkingLevel ? { ...baseOptions, reasoning: config.thinkingLevel } : baseOptions)
+			.result();
+
+		if (deps.signal?.aborted) {
+			deps.notify(`回退模型 ${provider}/${modelId} 摘要请求已被取消，丢弃返回的结果`, "warning");
+			return undefined;
+		}
+
+		// Whatever text a non-complete answer carries is unusable as a checkpoint: a `length`
+		// stop is a truncated summary, an `error` one may hold a partial paragraph.
+		const failure = describeIncompleteResponse(response);
+		if (failure) {
+			deps.notify(`回退模型 ${provider}/${modelId} ${failure.message}，已放弃回退压缩`, failure.level);
+			return undefined;
+		}
 
 		const summary = extractText(response);
 		if (!summary) {

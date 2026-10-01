@@ -45,12 +45,41 @@ test("a fallback attempt that fails again is terminal", () => {
 	assert.equal(state.current, "idle");
 });
 
-test("a failure while the retry is still queued is ignored", () => {
+test("a duplicate failure while the retry is still queued is ignored", () => {
 	const state = new FallbackState();
 	state.onCompactFailed("threshold", READY);
-	// e.g. the running turn then overflows and fails again before we ever got to retry
-	assert.equal(state.onCompactFailed("overflow", READY).kind, "ignore");
+	// e.g. another manual/threshold failure before we ever got to retry
+	assert.equal(state.onCompactFailed("manual", READY).kind, "ignore");
+	assert.equal(state.onCompactFailed("threshold", READY).kind, "ignore");
 	assert.equal(state.current, "retry-scheduled");
+});
+
+test("an overflow refusal upgrades a queued retry to the settle boundary", () => {
+	const state = new FallbackState();
+	state.onCompactFailed("threshold", READY);
+
+	// The running turn overflowed: the boundary path can keep it alive, and it uses the
+	// preparation of that overflow attempt, so it supersedes the idle retry.
+	assert.equal(state.onCompactFailed("overflow", READY).kind, "arm-boundary");
+	assert.equal(state.current, "fallback-armed-boundary");
+
+	// The superseded retry must not fire a late ctx.compact().
+	assert.equal(state.onRetryFired(), false);
+	assert.deepEqual(state.onBeforeSettle(true, TTL), { kind: "submit", continueRun: true });
+});
+
+test("a queued retry is only upgraded by a usable overflow refusal", () => {
+	const state = new FallbackState();
+	state.onCompactFailed("threshold", READY);
+
+	// A non-policy, disabled, or unconfigured overflow refusal must not replace the queued retry.
+	assert.equal(state.onCompactFailed("overflow", { ...READY, policyRefusal: false }).kind, "ignore");
+	assert.equal(state.onCompactFailed("overflow", { ...READY, autoRetry: false }).kind, "ignore");
+	assert.equal(state.onCompactFailed("overflow", { ...READY, modelConfigured: false }).kind, "ignore");
+	assert.equal(state.current, "retry-scheduled");
+
+	// And the retry is still there to fire.
+	assert.equal(state.onRetryFired(), true);
 });
 
 test("only one retry per failure, and no stickiness afterwards", () => {

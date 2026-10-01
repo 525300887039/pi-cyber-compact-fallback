@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
 
-import { loadConfig, resolveConfigPaths } from "../src/config.ts";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
+
+import { MAX_TIMER_DELAY_MS, loadConfig, resolveAgentDir, resolveConfigPaths } from "../src/config.ts";
 import { DEFAULT_CONFIG } from "../src/types.ts";
 
 const roots: string[] = [];
@@ -111,6 +113,23 @@ test("invalid values fall back to the default instead of wiping it", () => {
 	assert.equal(warnings.length, 8);
 });
 
+test("an idleTimeoutMs above the Node timer limit is capped, not turned into a 1 ms timer", () => {
+	const { cwd, env } = scaffold();
+	// Node rewrites a setTimeout delay above 2147483647 ms to 1 ms, which would abort every
+	// fallback summary instantly; the cap keeps a long deadline a long deadline.
+	writeProject(cwd, { idleTimeoutMs: MAX_TIMER_DELAY_MS + 1 });
+	const { config, warnings } = loadConfig(cwd, env);
+	assert.equal(config.idleTimeoutMs, MAX_TIMER_DELAY_MS);
+	assert.equal(warnings.length, 1);
+	assert.match(warnings[0] ?? "", /计时器上限/);
+
+	// The largest representable delay itself is accepted unchanged.
+	writeProject(cwd, { idleTimeoutMs: MAX_TIMER_DELAY_MS });
+	const accepted = loadConfig(cwd, env);
+	assert.equal(accepted.config.idleTimeoutMs, MAX_TIMER_DELAY_MS);
+	assert.deepEqual(accepted.warnings, []);
+});
+
 test("valid thinking levels are accepted", () => {
 	const { cwd, env } = scaffold();
 	writeProject(cwd, { thinkingLevel: "low" });
@@ -130,4 +149,48 @@ test("config paths follow PI_CODING_AGENT_DIR and the project cwd", () => {
 	const paths = resolveConfigPaths("/work/project", { PI_CODING_AGENT_DIR: "/custom/agent" });
 	assert.equal(paths.global, join("/custom/agent", "cyber-compact-fallback.json"));
 	assert.equal(paths.project, join("/work/project", ".pi", "cyber-compact-fallback.json"));
+});
+
+test("a missing or empty PI_CODING_AGENT_DIR keeps the default agent dir", () => {
+	const expected = join(homedir(), ".pi", "agent");
+	assert.equal(resolveAgentDir({}), expected);
+	assert.equal(resolveAgentDir({ PI_CODING_AGENT_DIR: "" }), expected);
+	assert.equal(resolveAgentDir({ PI_CODING_AGENT_DIR: "   " }), expected);
+});
+
+test("PI_CODING_AGENT_DIR expands ~ and ~/ like pi's getAgentDir", () => {
+	assert.equal(resolveAgentDir({ PI_CODING_AGENT_DIR: "~" }), homedir());
+	assert.equal(resolveAgentDir({ PI_CODING_AGENT_DIR: "~/custom-agent" }), join(homedir(), "custom-agent"));
+
+	// Absolute and relative paths are passed through unchanged, not resolved against the cwd.
+	assert.equal(resolveAgentDir({ PI_CODING_AGENT_DIR: "/custom/agent" }), "/custom/agent");
+	assert.equal(resolveAgentDir({ PI_CODING_AGENT_DIR: "relative/agent" }), "relative/agent");
+	// `~name` is a path of its own, not a home reference.
+	assert.equal(resolveAgentDir({ PI_CODING_AGENT_DIR: "~name" }), "~name");
+
+	// The Windows separator form expands on Windows only, exactly like the host.
+	const windowsForm = resolveAgentDir({ PI_CODING_AGENT_DIR: "~\\custom-agent" });
+	assert.equal(windowsForm, process.platform === "win32" ? join(homedir(), "custom-agent") : "~\\custom-agent");
+});
+
+test("resolveAgentDir agrees with the host's getAgentDir for every accepted form", () => {
+	// The host reads process.env directly; compare it against the injectable version for the
+	// shapes the compatibility fix promises: `~`, `~/…`, `~\…`, absolute, relative, empty.
+	const previous = process.env.PI_CODING_AGENT_DIR;
+	try {
+		for (const value of ["~", "~/custom-agent", "~\\custom-agent", "/abs/agent", "rel/agent", "~name", ""]) {
+			process.env.PI_CODING_AGENT_DIR = value;
+			assert.equal(resolveAgentDir(), getAgentDir(), `PI_CODING_AGENT_DIR=${JSON.stringify(value)}`);
+		}
+		delete process.env.PI_CODING_AGENT_DIR;
+		assert.equal(resolveAgentDir(), getAgentDir());
+	} finally {
+		if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previous;
+	}
+});
+
+test("config paths resolve a ~ override to the home directory", () => {
+	const paths = resolveConfigPaths("/work/project", { PI_CODING_AGENT_DIR: "~/custom-agent" });
+	assert.equal(paths.global, join(homedir(), "custom-agent", "cyber-compact-fallback.json"));
 });

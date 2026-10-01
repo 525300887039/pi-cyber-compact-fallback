@@ -29,7 +29,11 @@ export interface FallbackConfig {
 	maxSummaryTokens: number;
 	/** Safety cap on the serialized conversation handed to the fallback model. */
 	maxConversationChars: number;
-	/** How long to wait for the session to go idle (also bounds how long a boundary retry stays armed). */
+	/**
+	 * How long to wait for the session to go idle before giving up (also bounds how long a boundary
+	 * retry stays armed), and the deadline for each fallback summary request: a request still running
+	 * when it passes is abandoned, so a call that ignores its AbortSignal cannot stall the run.
+	 */
 	idleTimeoutMs: number;
 	/** Replaces the built-in summary prompt. Supports `{conversation}`, `{previousSummary}`, `{customInstructions}`. */
 	promptTemplate: string | null;
@@ -44,6 +48,11 @@ export const DEFAULT_CONFIG: FallbackConfig = {
 		"content[\\s_-]?filter",
 		"policy[\\s_-]?violation",
 		"safety[\\s_-]?(block|refus|filter)",
+		// pi-ai's Anthropic adapter maps `refusal` / `sensitive` stop reasons to these exact
+		// messages. Kept precise on purpose: bare `refus`/`sensitive` also appear in transport
+		// ("connection refused") and data ("sensitive file") errors, which must not retry.
+		"model\\s+refused",
+		"provider\\s+stopped with:\\s*sensitive",
 	],
 	caseInsensitive: true,
 	maxSummaryTokens: 8192,

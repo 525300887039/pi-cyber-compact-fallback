@@ -22,19 +22,43 @@ const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
 interface Recorded {
 	notifications: Array<{ message: string; level: string }>;
 	compactCalls: Array<Record<string, unknown>>;
+	/** Model requests actually issued, so a test can prove a cancelled one was never sent. */
+	modelCalls: number;
+	/** Options of every `streamSimple` call, so routing and reasoning can be asserted. */
+	streamOptions: Array<Record<string, unknown>>;
 }
 
-function makeCtx(
-	cwd: string,
-	options: { idle?: boolean; summary?: string | Error; findThrows?: boolean } = {},
-): { ctx: any; recorded: Recorded } {
-	const recorded: Recorded = { notifications: [], compactCalls: [] };
+interface CtxOptions {
+	/** Boolean, or a function so a test can flip idleness between polls. */
+	idle?: boolean | (() => boolean);
+	summary?: string | Error;
+	/** Full fake `AssistantMessage`, for exercising stopReason/errorMessage handling. */
+	response?: Record<string, unknown>;
+	/** Full control of the model call, e.g. a deferred that settles after the deadline. */
+	respond?: () => Promise<unknown>;
+	/** Runs inside the model call, e.g. to abort the signal mid-request. */
+	beforeRespond?: () => void;
+	findThrows?: boolean;
+}
+
+function makeCtx(cwd: string, options: CtxOptions = {}): { ctx: any; recorded: Recorded } {
+	const recorded: Recorded = { notifications: [], compactCalls: [], modelCalls: 0, streamOptions: [] };
 	const summary = options.summary ?? "SUMMARY";
+
+	// Only a complete `stop` may be persisted, so every normal fake says so explicitly.
+	const respond = async (): Promise<unknown> => {
+		recorded.modelCalls += 1;
+		if (options.respond) return options.respond();
+		if (summary instanceof Error) throw summary;
+		options.beforeRespond?.();
+		if (options.response) return options.response;
+		return { content: [{ type: "text", text: summary }], usage: { input: 1, output: 1 }, stopReason: "stop" };
+	};
 
 	const ctx = {
 		cwd,
 		signal: undefined,
-		isIdle: () => options.idle ?? true,
+		isIdle: () => (typeof options.idle === "function" ? options.idle() : options.idle ?? true),
 		ui: {
 			notify: (message: string, level: string) => {
 				recorded.notifications.push({ message, level });
@@ -46,18 +70,17 @@ function makeCtx(
 		modelRegistry: {
 			find: (provider: string, modelId: string) => {
 				if (options.findThrows) throw new Error("registry exploded");
-				return { provider, id: modelId };
+				// Virtual-model metadata: only `streamSimple` routes it, `complete` would fail on the host.
+				return { provider, id: modelId, api: "pi-virtual", name: `${provider}/${modelId}` };
 			},
-			complete: async () => {
-				if (summary instanceof Error) throw summary;
-				return { content: [{ type: "text", text: summary }], usage: { input: 1, output: 1 } };
+			// Deliberately a landmine: reaching for it means bypassing the virtual-model router.
+			complete: () => {
+				throw new Error("ModelRegistry.complete must not be used");
 			},
-			streamSimple: () => ({
-				result: async () => {
-					if (summary instanceof Error) throw summary;
-					return { content: [{ type: "text", text: summary }], usage: { input: 1, output: 1 } };
-				},
-			}),
+			streamSimple: (_model: unknown, _context: unknown, streamOptions: Record<string, unknown>) => {
+				recorded.streamOptions.push(streamOptions);
+				return { result: respond };
+			},
 		},
 	};
 
@@ -92,13 +115,14 @@ function beforeCompactEvent(
 	reason: string,
 	customInstructions?: string,
 	fileOps: { read?: Set<string>; written?: Set<string>; edited?: Set<string> } = {},
+	signal: AbortSignal = new AbortController().signal,
 ) {
 	return {
 		type: "session_before_compact",
 		reason,
 		customInstructions,
 		willRetry: reason === "overflow",
-		signal: new AbortController().signal,
+		signal,
 		branchEntries: [],
 		preparation: {
 			messagesToSummarize: [],
@@ -115,7 +139,53 @@ function failedEvent(reason: string, errorMessage: string, aborted = false) {
 	return { type: "session_compact_failed", reason, errorMessage, aborted, willRetry: false, fromExtension: false };
 }
 
+function settleEvent(canContinue = true) {
+	return {
+		type: "agent_before_settle",
+		entries: [],
+		continue: false,
+		outcome: "error",
+		context: { canContinue },
+	};
+}
+
 const settle = (ms = 60) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Let pending promise continuations run. */
+const flush = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+function writeConfig(config: Record<string, unknown>): void {
+	writeFileSync(join(process.env.PI_CODING_AGENT_DIR as string, "cyber-compact-fallback.json"), JSON.stringify(config), "utf8");
+}
+
+/**
+ * Capture the extension's timers and Date.now so the `poll → firing macrotask` chain can be
+ * stepped deterministically, without real sleeps. `step()` runs the next captured timer.
+ */
+function captureTimers() {
+	const scheduled: Array<() => void> = [];
+	const realSetTimeout = globalThis.setTimeout;
+	const realDateNow = Date.now;
+	let now = 1_000_000;
+
+	Date.now = () => now;
+	globalThis.setTimeout = ((fn: () => void) => {
+		scheduled.push(fn);
+		return 0 as unknown as ReturnType<typeof setTimeout>;
+	}) as unknown as typeof setTimeout;
+
+	return {
+		pending: () => scheduled.length,
+		step: () => scheduled.shift()?.(),
+		advance: (ms: number) => {
+			now += ms;
+		},
+		restore: () => {
+			globalThis.setTimeout = realSetTimeout;
+			Date.now = realDateNow;
+		},
+	};
+}
 
 afterEach(() => {
 	if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
@@ -339,6 +409,34 @@ test("overflow: the boundary is only honoured once", async () => {
 	assert.equal(second, undefined);
 });
 
+test("the fallback request goes through the provider-neutral streamSimple path", async () => {
+	const cwd = scaffold({ fallbackProvider: "test-provider", fallbackModel: "test-model" });
+	const handlers = loadExtension();
+	const { ctx, recorded } = makeCtx(cwd, { summary: "SUMMARY" });
+
+	handlers.get("session_compact_failed")?.(failedEvent("manual", CYBER_MESSAGE), ctx);
+	await settle();
+	await handlers.get("session_before_compact")?.(beforeCompactEvent("manual"), ctx);
+
+	// `complete` throws, so a successful summary proves it was never called.
+	assert.equal(recorded.modelCalls, 1);
+	assert.equal(recorded.streamOptions.length, 1);
+	assert.ok(!("reasoning" in (recorded.streamOptions[0] ?? {})), "reasoning must stay unset without a thinkingLevel");
+});
+
+test("thinkingLevel is passed as reasoning on the fallback request", async () => {
+	const cwd = scaffold({ fallbackProvider: "test-provider", fallbackModel: "test-model", thinkingLevel: "medium" });
+	const handlers = loadExtension();
+	const { ctx, recorded } = makeCtx(cwd, { summary: "SUMMARY" });
+
+	handlers.get("session_compact_failed")?.(failedEvent("manual", CYBER_MESSAGE), ctx);
+	await settle();
+	await handlers.get("session_before_compact")?.(beforeCompactEvent("manual"), ctx);
+
+	assert.equal(recorded.modelCalls, 1);
+	assert.equal(recorded.streamOptions[0]?.reasoning, "medium");
+});
+
 test("the config is re-read on every use, so edits take effect without a restart", async () => {
 	const cwd = scaffold({ fallbackProvider: "test-provider", fallbackModel: "first-model" });
 	const handlers = loadExtension();
@@ -439,4 +537,474 @@ test("a successful fallback compaction is not reported twice", async () => {
 
 	const completionNotices = recorded.notifications.filter((n) => n.message.includes("回退压缩完成"));
 	assert.equal(completionNotices.length, 1);
+});
+
+/**
+ * Only a `stop` response is a complete summary. These are the shapes pi-ai can return
+ * otherwise; all of them must be refused, even when they carry non-empty text.
+ */
+const INCOMPLETE_RESPONSES: Array<{ name: string; response: Record<string, unknown>; notice: RegExp }> = [
+	{
+		name: "error keeps the provider errorMessage",
+		response: { content: [{ type: "text", text: "PARTIAL" }], stopReason: "error", errorMessage: "upstream 500" },
+		notice: /摘要失败：upstream 500/,
+	},
+	{
+		name: "error without an errorMessage",
+		response: { content: [], stopReason: "error" },
+		notice: /摘要失败：未知错误/,
+	},
+	{
+		name: "length is a truncated summary",
+		response: { content: [{ type: "text", text: "PARTIAL" }], stopReason: "length" },
+		notice: /截断/,
+	},
+	{
+		name: "aborted",
+		response: { content: [{ type: "text", text: "PARTIAL" }], stopReason: "aborted" },
+		notice: /aborted/,
+	},
+	{
+		name: "pending",
+		response: { content: [], stopReason: "pending" },
+		notice: /pending/,
+	},
+	{
+		name: "toolUse",
+		response: { content: [{ type: "toolCall", id: "t1", name: "read", arguments: {} }], stopReason: "toolUse" },
+		notice: /toolUse/,
+	},
+	{
+		name: "tool call hidden in a stop response",
+		response: {
+			content: [{ type: "text", text: "TEXT" }, { type: "toolCall", id: "t1", name: "read", arguments: {} }],
+			stopReason: "stop",
+		},
+		notice: /toolCall/,
+	},
+	{
+		name: "response without a stopReason",
+		response: { content: [{ type: "text", text: "TEXT" }] },
+		notice: /stopReason=undefined/,
+	},
+];
+
+interface PathOptions {
+	response?: Record<string, unknown>;
+	signal?: AbortSignal;
+	beforeRespond?: () => void;
+}
+
+/** Manual path: refusal → idle → ctx.compact() → our session_before_compact. */
+async function runManualRetry(options: PathOptions = {}) {
+	const cwd = scaffold({ fallbackProvider: "test-provider", fallbackModel: "test-model" });
+	const handlers = loadExtension();
+	const { ctx, recorded } = makeCtx(cwd, { response: options.response, beforeRespond: options.beforeRespond });
+
+	handlers.get("session_compact_failed")?.(failedEvent("manual", CYBER_MESSAGE), ctx);
+	await settle();
+
+	const result = await handlers.get("session_before_compact")?.(
+		beforeCompactEvent("manual", undefined, {}, options.signal),
+		ctx,
+	);
+	return { result, recorded };
+}
+
+/** Overflow path: refusal → the settle boundary produces the summary itself. */
+async function runOverflow(options: PathOptions = {}) {
+	const cwd = scaffold({ fallbackProvider: "test-provider", fallbackModel: "test-model" });
+	const handlers = loadExtension();
+	const { ctx, recorded } = makeCtx(cwd, { response: options.response, beforeRespond: options.beforeRespond });
+	if (options.signal) ctx.signal = options.signal;
+
+	await handlers.get("session_before_compact")?.(beforeCompactEvent("overflow"), ctx);
+	handlers.get("session_compact_failed")?.(failedEvent("overflow", CYBER_MESSAGE), ctx);
+
+	const result = await handlers.get("agent_before_settle")?.(settleEvent(), ctx);
+	return { result, recorded };
+}
+
+test("manual retry: an incomplete fallback response is cancelled, never persisted", async (t) => {
+	for (const scenario of INCOMPLETE_RESPONSES) {
+		await t.test(scenario.name, async () => {
+			const { result, recorded } = await runManualRetry({ response: scenario.response });
+
+			assert.deepEqual(result, { cancel: true });
+			assert.equal(recorded.modelCalls, 1);
+			assert.match(recorded.notifications.at(-1)?.message ?? "", scenario.notice);
+		});
+	}
+});
+
+test("overflow: an incomplete fallback response is dropped, never written as an entry", async (t) => {
+	for (const scenario of INCOMPLETE_RESPONSES) {
+		await t.test(scenario.name, async () => {
+			const { result, recorded } = await runOverflow({ response: scenario.response });
+
+			assert.equal(result, undefined);
+			assert.equal(recorded.modelCalls, 1);
+			assert.match(recorded.notifications.at(-1)?.message ?? "", scenario.notice);
+		});
+	}
+});
+
+test("an already-cancelled signal never reaches the fallback model", async (t) => {
+	const aborted = new AbortController();
+	aborted.abort();
+
+	await t.test("manual retry", async () => {
+		const { result, recorded } = await runManualRetry({ signal: aborted.signal });
+
+		assert.deepEqual(result, { cancel: true });
+		assert.equal(recorded.modelCalls, 0, "an aborted compaction must not send a request");
+		assert.match(recorded.notifications.at(-1)?.message ?? "", /发出前已被取消/);
+	});
+
+	await t.test("overflow", async () => {
+		const { result, recorded } = await runOverflow({ signal: aborted.signal });
+
+		assert.equal(result, undefined);
+		assert.equal(recorded.modelCalls, 0, "an aborted compaction must not send a request");
+		assert.match(recorded.notifications.at(-1)?.message ?? "", /发出前已被取消/);
+	});
+});
+
+test("a response that arrives after cancellation is discarded even when it looks successful", async (t) => {
+	await t.test("manual retry", async () => {
+		const controller = new AbortController();
+		const { result, recorded } = await runManualRetry({
+			signal: controller.signal,
+			beforeRespond: () => controller.abort(),
+		});
+
+		assert.deepEqual(result, { cancel: true });
+		assert.equal(recorded.modelCalls, 1);
+		assert.match(recorded.notifications.at(-1)?.message ?? "", /丢弃返回的结果/);
+	});
+
+	await t.test("overflow", async () => {
+		const controller = new AbortController();
+		const { result, recorded } = await runOverflow({
+			signal: controller.signal,
+			beforeRespond: () => controller.abort(),
+		});
+
+		assert.equal(result, undefined);
+		assert.equal(recorded.modelCalls, 1);
+		assert.match(recorded.notifications.at(-1)?.message ?? "", /丢弃返回的结果/);
+	});
+});
+
+test("a queued retry is superseded by an overflow refusal and never fires late", async () => {
+	const cwd = scaffold({ fallbackProvider: "test-provider", fallbackModel: "test-model" });
+	const handlers = loadExtension();
+	const { ctx, recorded } = makeCtx(cwd, { summary: "BOUNDARY SUMMARY" });
+
+	// A threshold compaction is refused: the idle retry is queued.
+	const stale = beforeCompactEvent("threshold");
+	stale.preparation.firstKeptEntryId = "stale-entry";
+	await handlers.get("session_before_compact")?.(stale, ctx);
+	handlers.get("session_compact_failed")?.(failedEvent("threshold", CYBER_MESSAGE), ctx);
+	assert.match(recorded.notifications.at(-1)?.message ?? "", /空闲后/);
+
+	// Before it can fire, the same run overflows and pi's recovery compaction is refused too.
+	const overflow = beforeCompactEvent("overflow");
+	overflow.preparation.firstKeptEntryId = "overflow-entry";
+	await handlers.get("session_before_compact")?.(overflow, ctx);
+	handlers.get("session_compact_failed")?.(failedEvent("overflow", CYBER_MESSAGE), ctx);
+	assert.match(recorded.notifications.at(-1)?.message ?? "", /本轮结束时/);
+
+	// The queued retry must be gone: no late ctx.compact().
+	await settle();
+	assert.deepEqual(recorded.compactCalls, []);
+
+	// The boundary uses the overflow attempt's preparation, not the stale threshold one.
+	const result = (await handlers.get("agent_before_settle")?.(settleEvent(), ctx)) as any;
+
+	assert.equal(result?.entries?.[0]?.firstKeptEntryId, "overflow-entry");
+	assert.equal(result?.entries?.[0]?.summary, "BOUNDARY SUMMARY");
+	assert.equal(result?.continue, true);
+});
+
+test("agent_settled drops an unconsumed boundary arm so a cancelled run cannot leak it", async () => {
+	const cwd = scaffold({ fallbackProvider: "test-provider", fallbackModel: "test-model" });
+	const handlers = loadExtension();
+	const { ctx, recorded } = makeCtx(cwd);
+
+	await handlers.get("session_before_compact")?.(beforeCompactEvent("overflow"), ctx);
+	handlers.get("session_compact_failed")?.(failedEvent("overflow", CYBER_MESSAGE), ctx);
+
+	// The run was cancelled (Esc) before agent_before_settle could consume the arm.
+	handlers.get("agent_settled")?.({ type: "agent_settled" }, ctx);
+
+	// The next run's settle boundary must not submit the stale preparation.
+	assert.equal(await handlers.get("agent_before_settle")?.(settleEvent(), ctx), undefined);
+	assert.equal(recorded.modelCalls, 0);
+
+	// And the extension is not wedged: a fresh overflow can still arm and submit.
+	await handlers.get("session_before_compact")?.(beforeCompactEvent("overflow"), ctx);
+	handlers.get("session_compact_failed")?.(failedEvent("overflow", CYBER_MESSAGE), ctx);
+	const retry = (await handlers.get("agent_before_settle")?.(settleEvent(), ctx)) as any;
+
+	assert.equal(retry?.continue, true);
+});
+
+test("agent_settled keeps a queued manual retry", async () => {
+	const cwd = scaffold({ fallbackProvider: "test-provider", fallbackModel: "test-model" });
+	const handlers = loadExtension();
+	const { ctx, recorded } = makeCtx(cwd);
+
+	handlers.get("session_compact_failed")?.(failedEvent("manual", CYBER_MESSAGE), ctx);
+	handlers.get("agent_settled")?.({ type: "agent_settled" }, ctx);
+	await settle();
+
+	assert.equal(recorded.compactCalls.length, 1, "the idle retry must survive agent_settled");
+});
+
+test("autoRetry switched off while a retry is queued cancels it", async () => {
+	const cwd = scaffold({ fallbackProvider: "test-provider", fallbackModel: "test-model" });
+	const handlers = loadExtension();
+	const { ctx, recorded } = makeCtx(cwd);
+
+	handlers.get("session_compact_failed")?.(failedEvent("manual", CYBER_MESSAGE), ctx);
+	writeConfig({ fallbackProvider: "test-provider", fallbackModel: "test-model", autoRetry: false });
+	await settle();
+
+	assert.deepEqual(recorded.compactCalls, []);
+});
+
+test("autoRetry switched off before the armed compaction cancels instead of using the default summarizer", async () => {
+	const cwd = scaffold({ fallbackProvider: "test-provider", fallbackModel: "test-model" });
+	const handlers = loadExtension();
+	const { ctx, recorded } = makeCtx(cwd);
+
+	handlers.get("session_compact_failed")?.(failedEvent("manual", CYBER_MESSAGE), ctx);
+	await settle();
+	assert.equal(recorded.compactCalls.length, 1);
+
+	writeConfig({ fallbackProvider: "test-provider", fallbackModel: "test-model", autoRetry: false });
+	assert.deepEqual(await handlers.get("session_before_compact")?.(beforeCompactEvent("manual"), ctx), { cancel: true });
+	assert.equal(recorded.modelCalls, 0, "no fallback request after autoRetry was switched off");
+
+	// The state was released: a new refusal can arm again once autoRetry is back on.
+	writeConfig({ fallbackProvider: "test-provider", fallbackModel: "test-model" });
+	handlers.get("session_compact_failed")?.(failedEvent("manual", CYBER_MESSAGE), ctx);
+	await settle();
+	assert.equal(recorded.compactCalls.length, 2);
+});
+
+test("autoRetry switched off before the boundary submission drops it", async () => {
+	const cwd = scaffold({ fallbackProvider: "test-provider", fallbackModel: "test-model" });
+	const handlers = loadExtension();
+	const { ctx, recorded } = makeCtx(cwd);
+
+	await handlers.get("session_before_compact")?.(beforeCompactEvent("overflow"), ctx);
+	handlers.get("session_compact_failed")?.(failedEvent("overflow", CYBER_MESSAGE), ctx);
+
+	writeConfig({ fallbackProvider: "test-provider", fallbackModel: "test-model", autoRetry: false });
+	assert.equal(await handlers.get("agent_before_settle")?.(settleEvent(), ctx), undefined);
+	assert.equal(recorded.modelCalls, 0);
+
+	// Released: switching it back on lets a fresh overflow arm and submit.
+	writeConfig({ fallbackProvider: "test-provider", fallbackModel: "test-model" });
+	await handlers.get("session_before_compact")?.(beforeCompactEvent("overflow"), ctx);
+	handlers.get("session_compact_failed")?.(failedEvent("overflow", CYBER_MESSAGE), ctx);
+	const result = (await handlers.get("agent_before_settle")?.(settleEvent(), ctx)) as any;
+
+	assert.equal(result?.continue, true);
+});
+
+test("the firing macrotask goes back to polling when the session became busy", () => {
+	const cwd = scaffold({ fallbackProvider: "test-provider", fallbackModel: "test-model" });
+	const handlers = loadExtension();
+	let busy = false;
+	const { ctx, recorded } = makeCtx(cwd, { idle: () => !busy });
+
+	const timers = captureTimers();
+	try {
+		handlers.get("session_compact_failed")?.(failedEvent("manual", CYBER_MESSAGE), ctx);
+		assert.equal(timers.pending(), 1, "the idle poll is scheduled");
+
+		timers.step(); // poll: idle → schedules the firing macrotask
+		assert.equal(timers.pending(), 1);
+
+		busy = true;
+		timers.step(); // macrotask: busy → back to polling instead of interrupting the new run
+		assert.deepEqual(recorded.compactCalls, []);
+		assert.equal(timers.pending(), 1, "a new poll interval was scheduled");
+
+		busy = false;
+		timers.step(); // poll: idle again
+		timers.step(); // macrotask: fires
+		assert.equal(recorded.compactCalls.length, 1);
+	} finally {
+		timers.restore();
+	}
+});
+
+test("the firing macrotask re-checks the deadline and gives up", () => {
+	const cwd = scaffold({ fallbackProvider: "test-provider", fallbackModel: "test-model", idleTimeoutMs: 10 });
+	const handlers = loadExtension();
+	const { ctx, recorded } = makeCtx(cwd);
+
+	const timers = captureTimers();
+	try {
+		handlers.get("session_compact_failed")?.(failedEvent("manual", CYBER_MESSAGE), ctx);
+		timers.step(); // poll: still inside the deadline → schedules the macrotask
+		assert.equal(timers.pending(), 1);
+
+		timers.advance(11); // the deadline passes before the macrotask runs
+		timers.step();
+
+		assert.deepEqual(recorded.compactCalls, []);
+		assert.match(recorded.notifications.at(-1)?.message ?? "", /超时/);
+	} finally {
+		timers.restore();
+	}
+});
+
+test("a boundary summary without an upstream signal is abandoned at the deadline and the state released", async () => {
+	const cwd = scaffold({ fallbackProvider: "test-provider", fallbackModel: "test-model", idleTimeoutMs: 30 });
+	const handlers = loadExtension();
+	const { ctx, recorded } = makeCtx(cwd, { respond: () => new Promise(() => {}) });
+
+	await handlers.get("session_before_compact")?.(beforeCompactEvent("overflow"), ctx);
+	handlers.get("session_compact_failed")?.(failedEvent("overflow", CYBER_MESSAGE), ctx);
+
+	// ctx.signal is undefined in the settle phase, so only the deadline can end this.
+	assert.equal(await handlers.get("agent_before_settle")?.(settleEvent(), ctx), undefined);
+	assert.equal(recorded.modelCalls, 1);
+	assert.match(recorded.notifications.at(-1)?.message ?? "", /超过 30ms 未完成/);
+
+	// The handler released the state: a later overflow can arm and submit again.
+	const { ctx: healthy } = makeCtx(cwd, { summary: "SECOND" });
+	await handlers.get("session_before_compact")?.(beforeCompactEvent("overflow"), healthy);
+	handlers.get("session_compact_failed")?.(failedEvent("overflow", CYBER_MESSAGE), healthy);
+	const retry = (await handlers.get("agent_before_settle")?.(settleEvent(), healthy)) as any;
+
+	assert.equal(retry?.continue, true);
+	assert.equal(retry?.entries?.[0]?.summary, "SECOND");
+});
+
+test("a huge idleTimeoutMs does not turn the fallback request deadline into an instant abort", async () => {
+	// Node rewrites a setTimeout delay above 2^31-1 ms to 1 ms; the config caps the value so the
+	// request is still allowed to finish asynchronously instead of being aborted immediately.
+	const cwd = scaffold({
+		fallbackProvider: "test-provider",
+		fallbackModel: "test-model",
+		idleTimeoutMs: 2_147_483_648,
+	});
+	const handlers = loadExtension();
+	const { ctx, recorded } = makeCtx(cwd, {
+		respond: async () => {
+			await new Promise((resolve) => setTimeout(resolve, 25));
+			return { content: [{ type: "text", text: "SLOW SUMMARY" }], usage: { input: 1, output: 1 }, stopReason: "stop" };
+		},
+	});
+
+	await handlers.get("session_before_compact")?.(beforeCompactEvent("overflow"), ctx);
+	handlers.get("session_compact_failed")?.(failedEvent("overflow", CYBER_MESSAGE), ctx);
+
+	const result = (await handlers.get("agent_before_settle")?.(settleEvent(), ctx)) as any;
+
+	assert.equal(recorded.modelCalls, 1);
+	assert.equal(result?.entries?.[0]?.summary, "SLOW SUMMARY");
+});
+
+test("a late success from a call that ignores the signal is discarded, never committed", async () => {
+	const cwd = scaffold({ fallbackProvider: "test-provider", fallbackModel: "test-model", idleTimeoutMs: 20 });
+	const handlers = loadExtension();
+	let finish!: (value: unknown) => void;
+	const pending = new Promise((resolve) => {
+		finish = resolve;
+	});
+	const { ctx, recorded } = makeCtx(cwd, { respond: () => pending });
+
+	await handlers.get("session_before_compact")?.(beforeCompactEvent("overflow"), ctx);
+	handlers.get("session_compact_failed")?.(failedEvent("overflow", CYBER_MESSAGE), ctx);
+	assert.equal(await handlers.get("agent_before_settle")?.(settleEvent(), ctx), undefined);
+
+	// The call comes back after the deadline with a complete-looking answer.
+	finish({ content: [{ type: "text", text: "LATE SUMMARY" }], usage: { input: 1, output: 1 }, stopReason: "stop" });
+	await flush();
+
+	assert.equal(recorded.modelCalls, 1);
+	assert.match(recorded.notifications.at(-1)?.message ?? "", /丢弃返回的结果/);
+});
+
+test("a late rejection from a call that ignores the signal is handled, never committed", async () => {
+	const cwd = scaffold({ fallbackProvider: "test-provider", fallbackModel: "test-model", idleTimeoutMs: 20 });
+	const handlers = loadExtension();
+	let fail!: (error: Error) => void;
+	const pending = new Promise((_, reject) => {
+		fail = reject;
+	});
+	const { ctx, recorded } = makeCtx(cwd, { respond: () => pending });
+
+	await handlers.get("session_before_compact")?.(beforeCompactEvent("overflow"), ctx);
+	handlers.get("session_compact_failed")?.(failedEvent("overflow", CYBER_MESSAGE), ctx);
+	assert.equal(await handlers.get("agent_before_settle")?.(settleEvent(), ctx), undefined);
+
+	fail(new Error("late boom"));
+	await flush();
+
+	assert.match(recorded.notifications.at(-1)?.message ?? "", /摘要失败：late boom/);
+});
+
+test("the upstream compaction signal cancels a summary that is still in flight", async () => {
+	const cwd = scaffold({ fallbackProvider: "test-provider", fallbackModel: "test-model" });
+	const handlers = loadExtension();
+	const { ctx, recorded } = makeCtx(cwd, { respond: () => new Promise(() => {}) });
+
+	handlers.get("session_compact_failed")?.(failedEvent("manual", CYBER_MESSAGE), ctx);
+	await settle();
+
+	const controller = new AbortController();
+	const request = handlers.get("session_before_compact")?.(
+		beforeCompactEvent("manual", undefined, {}, controller.signal),
+		ctx,
+	);
+	assert.equal(recorded.modelCalls, 1, "the request was issued");
+
+	controller.abort();
+	assert.deepEqual(await request, { cancel: true });
+});
+
+test("session_shutdown aborts an in-flight summary", async () => {
+	const cwd = scaffold({ fallbackProvider: "test-provider", fallbackModel: "test-model" });
+	const handlers = loadExtension();
+	const { ctx, recorded } = makeCtx(cwd, { respond: () => new Promise(() => {}) });
+
+	handlers.get("session_compact_failed")?.(failedEvent("manual", CYBER_MESSAGE), ctx);
+	await settle();
+
+	const request = handlers.get("session_before_compact")?.(beforeCompactEvent("manual"), ctx);
+	assert.equal(recorded.modelCalls, 1);
+
+	handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "quit" }, ctx);
+	handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "quit" }, ctx);
+
+	assert.deepEqual(await request, { cancel: true });
+});
+
+test("session_shutdown clears a queued retry timer and an unconsumed boundary arm", async () => {
+	const cwd = scaffold({ fallbackProvider: "test-provider", fallbackModel: "test-model" });
+	const handlers = loadExtension();
+	const { ctx, recorded } = makeCtx(cwd);
+
+	handlers.get("session_compact_failed")?.(failedEvent("manual", CYBER_MESSAGE), ctx);
+	handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "quit" }, ctx);
+	handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "quit" }, ctx);
+	await settle();
+
+	assert.deepEqual(recorded.compactCalls, [], "the queued retry must not fire after shutdown");
+
+	// A boundary arm and its preparation are dropped too.
+	await handlers.get("session_before_compact")?.(beforeCompactEvent("overflow"), ctx);
+	handlers.get("session_compact_failed")?.(failedEvent("overflow", CYBER_MESSAGE), ctx);
+	handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "quit" }, ctx);
+
+	assert.equal(await handlers.get("agent_before_settle")?.(settleEvent(), ctx), undefined);
+	assert.equal(recorded.modelCalls, 0);
 });

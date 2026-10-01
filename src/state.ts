@@ -89,6 +89,21 @@ export class FallbackState {
 			return { kind: "fallback-failed" };
 		}
 
+		// An overflow refusal supersedes a retry that is still waiting for idle: the boundary path
+		// can keep the interrupted turn alive, and it uses the preparation of this same overflow
+		// attempt. Duplicates and non-policy failures must leave the queued retry alone.
+		if (
+			this.phase === "retry-scheduled" &&
+			reason === "overflow" &&
+			options.autoRetry &&
+			options.policyRefusal &&
+			options.modelConfigured
+		) {
+			this.phase = "fallback-armed-boundary";
+			this.armedAt = Date.now();
+			return { kind: "arm-boundary" };
+		}
+
 		// Already handling something (or waiting on the settle boundary): never arm twice.
 		if (this.phase !== "idle") return { kind: "ignore" };
 

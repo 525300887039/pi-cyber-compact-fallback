@@ -34,7 +34,13 @@ import type {
 import { loadConfig } from "../src/config.ts";
 import { compilePatterns, isPolicyRefusal } from "../src/detector.ts";
 import { FallbackState } from "../src/state.ts";
-import { type SummarizeDeps, type SummarizeInput, computeFileLists, summarize } from "../src/summarize.ts";
+import {
+	type SummarizeDeps,
+	type SummarizeInput,
+	type SummarizeOutcome,
+	computeFileLists,
+	summarize,
+} from "../src/summarize.ts";
 import type { FallbackConfig } from "../src/types.ts";
 
 type Preparation = SessionBeforeCompactEvent["preparation"];
@@ -45,6 +51,8 @@ const IDLE_POLL_INTERVAL_MS = 250;
 export default function cyberCompactFallback(pi: ExtensionAPI): void {
 	const state = new FallbackState();
 	const warned = new Set<string>();
+	/** Fallback summary requests that are in flight, so session_shutdown can abort them. */
+	const activeSummaries = new Set<AbortController>();
 	let preparation: Preparation | undefined;
 	let timer: ReturnType<typeof setTimeout> | undefined;
 
@@ -100,31 +108,75 @@ export default function cyberCompactFallback(pi: ExtensionAPI): void {
 	};
 
 	/**
-	 * pi's registry methods are generic over the provider api, so the extension treats the
-	 * registry structurally instead of threading those generics through.
+	 * pi has no abort signal during the settle boundary (`ctx.signal` is undefined there), and the
+	 * extension must not touch pi's key handling, so every fallback request gets its own controller:
+	 * it is aborted by the upstream compaction signal when there is one, by `session_shutdown`, or by
+	 * the `idleTimeoutMs` deadline. The race is what makes the handler return on time even when the
+	 * underlying call ignores its AbortSignal or never settles; a late result is never committed.
 	 */
-	const runSummary = (
+	const runSummary = async (
 		input: SummarizeInput,
 		ctx: ExtensionContext,
 		config: FallbackConfig,
 		signal: AbortSignal | undefined,
-	): ReturnType<typeof summarize> =>
-		summarize(input, config, {
-			modelRegistry: ctx.modelRegistry as unknown as SummarizeDeps["modelRegistry"],
-			notify: (message, level) => notify(ctx, message, level),
-			signal,
-		});
+	): Promise<SummarizeOutcome | undefined> => {
+		const local = new AbortController();
+		activeSummaries.add(local);
+
+		const abortFromUpstream = (): void => local.abort();
+		if (signal?.aborted) local.abort();
+		else signal?.addEventListener("abort", abortFromUpstream, { once: true });
+
+		let timedOut = false;
+		const deadline = setTimeout(() => {
+			timedOut = true;
+			local.abort();
+		}, config.idleTimeoutMs);
+
+		try {
+			const request = summarize(input, config, {
+				modelRegistry: ctx.modelRegistry as unknown as SummarizeDeps["modelRegistry"],
+				notify: (message, level) => notify(ctx, message, level),
+				signal: local.signal,
+			});
+
+			const aborted = new Promise<never>((_, reject) => {
+				const fail = (): void => reject(new Error("fallback summary aborted"));
+				if (local.signal.aborted) fail();
+				else local.signal.addEventListener("abort", fail, { once: true });
+			});
+
+			try {
+				return await Promise.race([request, aborted]);
+			} catch {
+				if (timedOut) {
+					notify(ctx, `回退摘要请求超过 ${config.idleTimeoutMs}ms 未完成，已放弃回退压缩`, "warning");
+				}
+				return undefined;
+			}
+		} finally {
+			clearTimeout(deadline);
+			signal?.removeEventListener("abort", abortFromUpstream);
+			activeSummaries.delete(local);
+			// Stops a request that is still running after we stopped waiting for it.
+			local.abort();
+		}
+	};
 
 	const scheduleRetry = (ctx: ExtensionContext, config: FallbackConfig): void => {
 		const deadline = Date.now() + config.idleTimeoutMs;
+
+		const expire = (): void => {
+			state.cancelRetry();
+			notify(ctx, "等待会话空闲超时，已放弃自动重试；可手动执行 /compact", "warning");
+		};
 
 		const poll = (): void => {
 			if (state.current !== "retry-scheduled") return;
 
 			const remaining = deadline - Date.now();
 			if (remaining <= 0) {
-				state.cancelRetry();
-				notify(ctx, "等待会话空闲超时，已放弃自动重试；可手动执行 /compact", "warning");
+				expire();
 				return;
 			}
 
@@ -138,6 +190,23 @@ export default function cyberCompactFallback(pi: ExtensionAPI): void {
 			// clears the abort controller unconditionally, and starting a new compaction
 			// before that would have the controller cleared out from under it.
 			timer = setTimeout(() => {
+				// Re-check before firing: a new run may have started while this macrotask waited, the
+				// deadline may have passed, and the config may have changed. Interrupting a live run,
+				// compacting after giving up, or compacting after `autoRetry` was switched off are all
+				// worse than going back to polling.
+				if (deadline - Date.now() <= 0) {
+					expire();
+					return;
+				}
+				if (!ctx.isIdle()) {
+					poll();
+					return;
+				}
+				if (!load(ctx).autoRetry) {
+					state.cancelRetry();
+					return;
+				}
+
 				if (!state.onRetryFired()) return;
 
 				// No onError notification: pi both invokes it and emits session_compact_failed for the
@@ -161,6 +230,13 @@ export default function cyberCompactFallback(pi: ExtensionAPI): void {
 		// conversation to the same refusing upstream again. Cancel instead, always.
 		try {
 			const config = load(ctx);
+			// The config is re-read here: if `autoRetry` was switched off after this retry was armed,
+			// cancel the compaction we triggered instead of letting pi run its default summarizer
+			// against the same upstream that just refused.
+			if (!config.autoRetry) {
+				state.reset();
+				return { cancel: true };
+			}
 			const outcome = await runSummary(
 				{
 					messagesToSummarize: event.preparation.messagesToSummarize,
@@ -220,6 +296,8 @@ export default function cyberCompactFallback(pi: ExtensionAPI): void {
 				notify(ctx, `回退压缩也未成功（${event.errorMessage ?? "已取消"}），已放弃自动重试`, "error");
 				return;
 			case "arm-boundary":
+				// This run's boundary supersedes any retry still waiting for idle; its timer must go.
+				clearTimer();
 				notify(ctx, `压缩被内容策略拒绝，将在本轮结束时用 ${modelLabel(config)} 重压并继续…`, "info");
 				return;
 			case "arm-retry":
@@ -237,6 +315,13 @@ export default function cyberCompactFallback(pi: ExtensionAPI): void {
 
 		if (decision.kind === "expired") {
 			notify(ctx, "回退压缩布防超时，已放弃；可手动执行 /compact", "warning");
+			return undefined;
+		}
+
+		// Same live check as the other entry points: switching autoRetry off releases this action.
+		if (!config.autoRetry) {
+			state.reset();
+			preparation = undefined;
 			return undefined;
 		}
 
@@ -292,8 +377,21 @@ export default function cyberCompactFallback(pi: ExtensionAPI): void {
 			if (state.current === "boundary-running") state.reset();
 		}
 	});
+
+	pi.on("agent_settled", () => {
+		// A cancelled run skips agent_before_settle, so an unconsumed boundary arm would otherwise
+		// leak into the next run together with its stale preparation. The queued manual/threshold
+		// retry is still waiting on its timer and must survive this.
+		if (state.current === "fallback-armed-boundary") {
+			state.reset();
+			preparation = undefined;
+		}
+	});
+
 	pi.on("session_shutdown", () => {
 		clearTimer();
+		preparation = undefined;
+		for (const controller of activeSummaries) controller.abort();
 		state.reset();
 	});
 }
